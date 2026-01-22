@@ -54,7 +54,7 @@ class RoadgraphProcessor:
             18: (255, 255, 255, 0),
             19: (255, 255, 255, 255),
             20:  (0, 0, 0, 0)}
-        return type_to_color[segment_type]
+        return type_to_color.get(segment_type, (0, 0, 0, 0))
 
     def _prepare_segments(self):
         graph_segments = []
