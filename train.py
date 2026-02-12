@@ -2,7 +2,6 @@
 import os
 import argparse
 from glob import glob
-from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
@@ -61,44 +60,6 @@ def dict_to_cuda(data_dict: Dict[str, torch.Tensor], device: torch.device):
 
 
 # ----------------------------
-# Model
-# ----------------------------
-def get_model(model_config):
-    # x, y, sigma_xx, sigma_yy, visibility
-    n_components = 5
-    n_modes = model_config['n_modes']
-    n_timestamps = model_config['n_timestamps']
-    output_dim = n_modes + n_modes * n_timestamps * n_components
-    model = timm.create_model(
-        model_config['backbone'],
-        pretrained=True,
-        in_chans=27,
-        num_classes=output_dim
-    )
-    return model
-
-
-def limited_softplus(x):
-    return torch.clamp(F.softplus(x), min=0.1, max=10)
-
-
-def postprocess_predictions(predicted_tensor, model_config):
-    confidences = predicted_tensor[:, :model_config['n_modes']]
-    components = predicted_tensor[:, model_config['n_modes']:]
-    components = components.reshape(-1, model_config['n_modes'], model_config['n_timestamps'], 5)
-    sigma_xx = components[:, :, :, 2:3]
-    sigma_yy = components[:, :, :, 3:4]
-    visibility = components[:, :, :, 4:]
-    return {
-        'confidences': confidences,  # logits
-        'xy': components[:, :, :, :2],
-        'sigma_xx': limited_softplus(sigma_xx) if model_config['predict_covariances'] else torch.ones_like(sigma_xx),
-        'sigma_yy': limited_softplus(sigma_yy) if model_config['predict_covariances'] else torch.ones_like(sigma_yy),
-        'visibility': visibility
-    }
-
-
-# ----------------------------
 # DDP helpers
 # ----------------------------
 def is_dist() -> bool:
@@ -131,7 +92,61 @@ def ddp_cleanup():
 
 
 # ----------------------------
-# Metrics: Precision / Recall / mAP50 / mAP50-95 (по порогам FDE в метрах)
+# Model
+# ----------------------------
+def get_model(model_config):
+    # x, y, sigma_xx, sigma_yy, visibility
+    n_components = 5
+    n_modes = model_config['n_modes']
+    n_timestamps = model_config['n_timestamps']
+    output_dim = n_modes + n_modes * n_timestamps * n_components
+
+    pretrained = bool(model_config.get("pretrained", True))
+    # In DDP avoid multiple downloads; only rank0 uses pretrained=True
+    if is_dist() and not is_main_process():
+        pretrained = False
+
+    try:
+        model = timm.create_model(
+            model_config['backbone'],
+            pretrained=pretrained,
+            in_chans=27,
+            num_classes=output_dim
+        )
+    except Exception as e:
+        if pretrained and is_main_process():
+            print(f"[WARN] Failed to load pretrained weights ({e}). Falling back to pretrained=False.")
+        model = timm.create_model(
+            model_config['backbone'],
+            pretrained=False,
+            in_chans=27,
+            num_classes=output_dim
+        )
+    return model
+
+
+def limited_softplus(x):
+    return torch.clamp(F.softplus(x), min=0.1, max=10)
+
+
+def postprocess_predictions(predicted_tensor, model_config):
+    confidences = predicted_tensor[:, :model_config['n_modes']]
+    components = predicted_tensor[:, model_config['n_modes']:]
+    components = components.reshape(-1, model_config['n_modes'], model_config['n_timestamps'], 5)
+    sigma_xx = components[:, :, :, 2:3]
+    sigma_yy = components[:, :, :, 3:4]
+    visibility = components[:, :, :, 4:]
+    return {
+        'confidences': confidences,  # logits
+        'xy': components[:, :, :, :2],
+        'sigma_xx': limited_softplus(sigma_xx) if model_config['predict_covariances'] else torch.ones_like(sigma_xx),
+        'sigma_yy': limited_softplus(sigma_yy) if model_config['predict_covariances'] else torch.ones_like(sigma_yy),
+        'visibility': visibility
+    }
+
+
+# ----------------------------
+# Metrics: Precision / Recall / mAP50 / mAP50-95 (via FDE thresholds in meters)
 # ----------------------------
 def _ap_from_pr(precision: np.ndarray, recall: np.ndarray) -> float:
     """COCO-style AP: 101-point interpolated precision."""
@@ -261,7 +276,7 @@ def parse_arguments():
     parser.add_argument("--val-data-path", type=str, required=True, help="Path to validation data")
     parser.add_argument("--checkpoints-path", type=str, required=True, help="Path to checkpoints")
     parser.add_argument("--config", type=str, required=True, help="Config file path")
-    parser.add_argument("--multi-gpu", action='store_true', help="Legacy DataParallel. For 2x4090 prefer torchrun+DDP.")
+    parser.add_argument("--multi-gpu", action='store_true', help="Legacy DataParallel. Prefer torchrun+DDP.")
     args = parser.parse_args()
     return args
 
@@ -275,7 +290,6 @@ def get_last_checkpoint_file(path: str) -> Optional[str]:
 
 
 def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    # helps load DP/DDP checkpoints into plain model
     if not state_dict:
         return state_dict
     keys = list(state_dict.keys())
@@ -411,11 +425,10 @@ def main():
     args = parse_arguments()
     ddp_setup()
 
-    # Device
     local_rank = get_local_rank()
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
-    # Speed knobs for RTX 4090 / Ada
+    # Speed knobs
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     try:
@@ -443,7 +456,7 @@ def main():
     epochs_processed = 0
 
     experiment_checkpoints_dir = os.path.join(args.checkpoints_path, config_name)
-    if is_main_process() and (not os.path.exists(experiment_checkpoints_dir)):
+    if is_main_process():
         os.makedirs(experiment_checkpoints_dir, exist_ok=True)
     if is_dist():
         dist.barrier()
@@ -471,24 +484,33 @@ def main():
     elif args.multi_gpu and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # Data
+    # ----------------------------
+    # Data  (FIXED: avoid passing shuffle twice)
+    # ----------------------------
     train_dataset = MotionCNNDataset(args.train_data_path)
     val_dataset = MotionCNNDataset(args.val_data_path, load_roadgraph=True)
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_dist() else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_dist() else None
 
+    train_dl_cfg = dict(training_config["train_dataloader"])
+    train_shuffle = bool(train_dl_cfg.pop("shuffle", True))  # remove from cfg to avoid double shuffle kw
+
+    val_dl_cfg = dict(training_config["val_dataloader"])
+    val_dl_cfg.pop("shuffle", None)  # remove if exists
+
     train_loader = DataLoader(
         train_dataset,
         sampler=train_sampler,
-        shuffle=(train_sampler is None and training_config["train_dataloader"].get("shuffle", True)),
-        **training_config['train_dataloader']
+        shuffle=(train_shuffle if train_sampler is None else False),
+        **train_dl_cfg,
     )
+
     val_loader = DataLoader(
         val_dataset,
         sampler=val_sampler,
         shuffle=False,
-        **training_config['val_dataloader']
+        **val_dl_cfg,
     )
 
     # AMP
@@ -555,7 +577,7 @@ def main():
                     writer.add_scalar("train/loss", np.mean(running_losses[-100:]), global_step)
                     writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
-        # --- Validation after each epoch ---
+        # Validation after each epoch
         metrics = validate_one_epoch(model, val_loader, loss_module, model_config, training_config, device)
 
         if is_main_process():
@@ -574,9 +596,8 @@ def main():
                 writer.add_scalar("val/mAP50", metrics["mAP50"], epoch)
                 writer.add_scalar("val/mAP50_95", metrics["mAP50_95"], epoch)
 
-        # --- Save checkpoint ---
+        # Save checkpoint
         if is_main_process() and (save_every_epochs > 0) and ((epoch + 1) % save_every_epochs == 0):
-            # unwrap DP/DDP
             if isinstance(model, (nn.DataParallel, DDP)):
                 model_state_dict = model.module.state_dict()
             else:
@@ -587,12 +608,11 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "epochs_processed": epoch + 1,
                 "processed_batches": processed_batches,
-                "metrics": metrics if is_main_process() else None,
+                "metrics": metrics,
             }
             last_path = os.path.join(experiment_checkpoints_dir, "last.pth")
             torch.save(ckpt, last_path)
 
-            # optional epoch snapshot
             snap_path = os.path.join(experiment_checkpoints_dir, f"epoch_{epoch+1:03d}.pth")
             torch.save(ckpt, snap_path)
 
