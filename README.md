@@ -1,3 +1,28 @@
+# MotionCNN: ответвление для дипломного проекта env-predict
+
+Ответвление репозитория [stepankonev/MotionCNN-Waymo-Open-Motion-Dataset](https://github.com/stepankonev/MotionCNN-Waymo-Open-Motion-Dataset) для дипломного проекта [env-predict](https://github.com/ExPl0i/env-predict). Здесь используется для обучения модели MotionCNN на наборе Waymo Open Motion Dataset v1.3.1 (формат tf.Example). Описание авторов приведено ниже без изменений.
+
+## Изменения относительно оригинала
+
+- `Dockerfile`: образ на основе `nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04` с Python 3.8 и PyTorch 2.0.0 (CUDA 11.8). TensorFlow 2.6.0 заменен версией для процессора: он нужен только для чтения файлов Waymo при растеризации.
+- `docker-run.sh`: запуск контейнера на двух видеокартах с подключением данных Waymo Open Motion Dataset, папки растров и папки весов.
+- `prerender.sh`: растеризация части `training` по частям (параметры `--n-shards` и `--shard-id`); неизвестные типы элементов дорожного графа в `prerender.py` больше не вызывают ошибку.
+- `train.py`, `train.sh`: распределенное обучение через `torchrun` на двух видеокартах, смешанная точность bf16, ограничение нормы градиента, журнал TensorBoard, возобновление с последних сохраненных весов, проверка после каждой эпохи.
+- `metrics_ap.py`: расчет средней точности (mAP) по порогам расстояния, заданным в конфигурации.
+- `configs/basic.yaml`: параметры растра (512 × 512 пикселей, масштаб 3), модели (resnet34, 3 варианта траектории, 80 шагов) и обучения (60 эпох, размер пакета 64 на видеокарту, скорость обучения 0,0003).
+
+## Порядок запуска
+
+1. Собрать образ: `docker build -t expl0i/motioncnn:cu118 .`
+2. Поправить пути к данным в `docker-run.sh` и запустить контейнер: `bash docker-run.sh`
+3. Внутри контейнера (`docker exec -it motioncnn_2 bash`): растеризация `bash prerender.sh` для каждой части обучающих данных и для части `validation`, затем обучение `bash train.sh`.
+
+## Где хранятся веса и прогнозы
+
+Веса после эпохи 14 (итерация 240 000) и после эпохи 6 из второго запуска обучения, а также растры части `validation` хранятся в приватном датасете [ExPl0i/env-predict-data](https://huggingface.co/datasets/ExPl0i/env-predict-data), наборы `models` и `preprocessed_validation`. Прогнозы этих весов есть в выгрузке веб-приложения (набор `ui_bundle_motioncnn`).
+
+---
+
 # Refactored implementation of paper "MotionCNN: A Strong Baseline for Motion Prediction in Autonomous Driving"
 ![MotionCNN Neural Network Scheme](img/header.png)
 This repository contains updated code for our team's solution of Waymo Motion Prediction Challenge 2021 where we have achieved 3rd place.
